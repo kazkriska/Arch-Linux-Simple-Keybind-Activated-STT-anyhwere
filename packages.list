@@ -1,0 +1,5 @@
+sudo pacman -S --needed socat
+
+sudo pacman -S --needed wtype alsa-utils python python-pip
+
+sudo pacman -S --needed pipewire wtype python
