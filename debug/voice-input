@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 
 from faster_whisper import WhisperModel
@@ -36,23 +37,27 @@ def log(msg):
 
 
 def notify(state, body):
-    """Send a stateful notification via dunstify."""
+    """Send a stateful notification via dunstify.
+    
+    Uses --stack-tag so the same notification is replaced
+    in-place across separate process invocations.
+    """
     states = {
-        "listening":    ("Voice Input: Listening...",   "audio-input-microphone",  "normal"),
-        "transcribing": ("Voice Input: Transcribing...", "audio-input-microphone",  "normal"),
-        "finalizing":   ("Voice Input: Finalizing...",   "audio-input-microphone",  "normal"),
-        "done":         ("Voice Input: Done",            "audio-input-microphone",  "low"),
-        "error":        (f"Voice Input: {state}",        "audio-input-microphone",  "critical"),
+        "listening":    ("Voice Input: Listening...",   "audio-input-microphone",  "normal",  "0"),
+        "transcribing": ("Voice Input: Transcribing...", "audio-input-microphone",  "normal",  "0"),
+        "finalizing":   ("Voice Input: Finalizing...",   "audio-input-microphone",  "normal",  "0"),
+        "done":         ("Voice Input: Done",            "audio-input-microphone",  "low",     "3000"),
+        "error":        (f"Voice Input: {state}",        "audio-input-microphone",  "critical", "5000"),
     }
-    summary, icon, urgency = states.get(state, (state, "microphone-input", "normal"))
+    summary, icon, urgency, expiry = states.get(state, (state, "audio-input-microphone", "normal", "3000"))
     try:
         subprocess.run(
             [
                 "dunstify",
-                "-r", "9999",
-                "-t", "0" if state not in ("done", "error") else ("3000" if state == "done" else "5000"),
+                "--stack-tag", "voice-input",
+                "--app-name", "voice-input",
+                "-t", expiry,
                 "-u", urgency,
-                "-a", "voice-input",
                 "-i", icon,
                 summary,
                 body,
@@ -102,7 +107,8 @@ def set_bluetooth_profile(profile):
         log(f"BT profile set error: {e}")
 
 
-_recording_timer = None
+_recording_monitor = None
+_audio_active = False
 
 
 def _force_stop():
@@ -112,8 +118,23 @@ def _force_stop():
         recorder.terminate()
 
 
+def _monitor_audio_activity():
+    """Monitor audio file during recording to detect active speech."""
+    global _audio_active
+    last_size = 0
+    while recorder is not None and recorder.poll() is None:
+        time.sleep(0.5)
+        if os.path.exists(AUDIO):
+            current_size = os.path.getsize(AUDIO)
+            if current_size > last_size + 5000:  # Growing by >5KB = active speech
+                if not _audio_active:
+                    _audio_active = True
+                    notify("transcribing", "Speech detected, listening...")
+            last_size = current_size
+
+
 def start_recording():
-    global recorder, _recording_timer
+    global recorder, _recording_timer, _recording_monitor, _audio_active
 
     with _lock:
         if recorder is not None and recorder.poll() is None:
@@ -140,6 +161,7 @@ def start_recording():
             return
 
         log("START recording")
+        _audio_active = False
         recorder = subprocess.Popen([
             "pw-record",
             "--rate", "16000",
@@ -153,11 +175,16 @@ def start_recording():
         _recording_timer.daemon = True
         _recording_timer.start()
 
+        # Start audio activity monitor to detect speech in real-time
+        _recording_monitor = threading.Thread(target=_monitor_audio_activity)
+        _recording_monitor.daemon = True
+        _recording_monitor.start()
+
     notify("listening", "Speak now. Release ALT+T when done.")
 
 
 def stop_recording():
-    global recorder, _recording_timer
+    global recorder, _recording_timer, _recording_monitor, _audio_active
 
     with _lock:
         if recorder is None:
@@ -180,6 +207,7 @@ def stop_recording():
                 recorder.wait()
 
         recorder = None
+        _audio_active = False
 
         # T4.2: Validate audio file before transcription
         if not os.path.exists(AUDIO):
@@ -195,7 +223,7 @@ def stop_recording():
             return
 
         log(f"Audio file size: {file_size} bytes")
-        notify("transcribing", "Processing your speech...")
+        notify("finalizing", "Almost done...")
 
     # T1.2: Exception isolation — daemon must NEVER crash here
     text = ""
