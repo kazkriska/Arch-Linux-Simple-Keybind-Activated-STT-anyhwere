@@ -22,6 +22,7 @@ MODEL_PATH = os.path.expanduser(
 model = None
 recorder = None
 _lock = threading.Lock()
+_processing = False  # T5: Blocking flag for transcription/finalize
 MAX_RECORDING_SECONDS = 60
 
 
@@ -36,27 +37,27 @@ def log(msg):
         pass
 
 
-def notify(state, body):
-    """Send a stateful notification via dunstify.
-    
-    Uses --stack-tag so the same notification is replaced
-    in-place across separate process invocations.
-    """
+def notify(state, body, timeout=None):
+    """Send a stateful notification via dunstify."""
     states = {
-        "listening":    ("Voice Input: Listening...",   "audio-input-microphone",  "normal",  "0"),
-        "transcribing": ("Voice Input: Transcribing...", "audio-input-microphone",  "normal",  "0"),
-        "finalizing":   ("Voice Input: Finalizing...",   "audio-input-microphone",  "normal",  "0"),
-        "done":         ("Voice Input: Done",            "audio-input-microphone",  "low",     "3000"),
-        "error":        (f"Voice Input: {state}",        "audio-input-microphone",  "critical", "5000"),
+        "listening":    ("Voice Input: Listening...",   "audio-input-microphone",  "normal"),
+        "transcribing": ("Voice Input: Transcribing...", "audio-input-microphone",  "normal"),
+        "finalizing":   ("Voice Input: Finalizing...",   "audio-input-microphone",  "normal"),
+        "done":         ("Voice Input: Done",            "audio-input-microphone",  "low"),
+        "error":        (f"Voice Input: {state}",        "audio-input-microphone",  "critical"),
+        "busy":         ("Voice Input: Busy",            "audio-input-microphone",  "normal"),
+        "warning":      ("Voice Input: Warning",         "audio-input-microphone",  "normal"),
     }
-    summary, icon, urgency, expiry = states.get(state, (state, "audio-input-microphone", "normal", "3000"))
+    summary, icon, urgency = states.get(state, (state, "audio-input-microphone", "normal"))
+    if timeout is None:
+        timeout = "0" if state not in ("done", "error", "busy", "warning") else ("3000" if state == "done" else "5000")
     try:
         subprocess.run(
             [
                 "dunstify",
                 "--stack-tag", "voice-input",
                 "--app-name", "voice-input",
-                "-t", expiry,
+                "-t", str(timeout),
                 "-u", urgency,
                 "-i", icon,
                 summary,
@@ -107,15 +108,32 @@ def set_bluetooth_profile(profile):
         log(f"BT profile set error: {e}")
 
 
+_recording_timer = None
+_countdown_timer = None
 _recording_monitor = None
 _audio_active = False
+_recording_start_time = None
 
 
 def _force_stop():
+    """Called when MAX_RECORDING_SECONDS is reached."""
     global recorder
-    log("MAX recording duration reached, force-stopping")
+    log("MAX recording duration reached, stopping and processing")
     if recorder is not None and recorder.poll() is None:
         recorder.terminate()
+    # Trigger transcription
+    stop_recording()
+
+
+def _update_countdown():
+    """Update notification with remaining time every second."""
+    global _recording_start_time
+    while recorder is not None and recorder.poll() is None:
+        elapsed = time.time() - _recording_start_time
+        remaining = max(0, MAX_RECORDING_SECONDS - int(elapsed))
+        if remaining <= 10:
+            notify("listening", f"Speak now. Release ALT+T when done. ({remaining}s left)")
+        time.sleep(1)
 
 
 def _monitor_audio_activity():
@@ -126,7 +144,7 @@ def _monitor_audio_activity():
         time.sleep(0.5)
         if os.path.exists(AUDIO):
             current_size = os.path.getsize(AUDIO)
-            if current_size > last_size + 5000:  # Growing by >5KB = active speech
+            if current_size > last_size + 5000:
                 if not _audio_active:
                     _audio_active = True
                     notify("transcribing", "Speech detected, listening...")
@@ -134,11 +152,18 @@ def _monitor_audio_activity():
 
 
 def start_recording():
-    global recorder, _recording_timer, _recording_monitor, _audio_active
+    global recorder, _recording_timer, _countdown_timer, _recording_monitor, _audio_active, _recording_start_time, _processing
 
     with _lock:
+        # T5: If currently processing (transcribing/finalizing), reject
+        if _processing:
+            log("BLOCKED: still processing previous request")
+            notify("busy", "Still processing previous recording, please wait...")
+            return
+
         if recorder is not None and recorder.poll() is None:
             log("Already recording, ignoring duplicate start")
+            notify("warning", "Already recording! Release ALT+T to stop.")
             return
 
         if os.path.exists(AUDIO):
@@ -162,6 +187,7 @@ def start_recording():
 
         log("START recording")
         _audio_active = False
+        _recording_start_time = time.time()
         recorder = subprocess.Popen([
             "pw-record",
             "--rate", "16000",
@@ -175,26 +201,33 @@ def start_recording():
         _recording_timer.daemon = True
         _recording_timer.start()
 
-        # Start audio activity monitor to detect speech in real-time
+        # Start countdown timer
+        _countdown_timer = threading.Thread(target=_update_countdown)
+        _countdown_timer.daemon = True
+        _countdown_timer.start()
+
+        # Start audio activity monitor
         _recording_monitor = threading.Thread(target=_monitor_audio_activity)
         _recording_monitor.daemon = True
         _recording_monitor.start()
 
-    notify("listening", "Speak now. Release ALT+T when done.")
+    notify("listening", f"Speak now. Release ALT+T when done. (max {MAX_RECORDING_SECONDS}s)")
 
 
 def stop_recording():
-    global recorder, _recording_timer, _recording_monitor, _audio_active
+    global recorder, _recording_timer, _countdown_timer, _recording_monitor, _audio_active, _processing, _recording_start_time
 
     with _lock:
         if recorder is None:
             log("stop called but no active recorder")
             return
 
-        # Cancel the max-duration timer
+        # Cancel timers
         if _recording_timer is not None:
             _recording_timer.cancel()
             _recording_timer = None
+        if _countdown_timer is not None:
+            _countdown_timer = None  # Will exit on next iteration
 
         if recorder.poll() is None:
             log("STOP recording")
@@ -208,11 +241,12 @@ def stop_recording():
 
         recorder = None
         _audio_active = False
+        _processing = True  # Lock: now entering transcription phase
 
-        # T4.2: Validate audio file before transcription
         if not os.path.exists(AUDIO):
             log("No audio file created.")
             notify("error", "No audio was recorded")
+            _processing = False
             return
 
         file_size = os.path.getsize(AUDIO)
@@ -220,12 +254,14 @@ def stop_recording():
             log("Audio file is empty (0 bytes).")
             os.remove(AUDIO)
             notify("error", "Recording was empty")
+            _processing = False
             return
 
-        log(f"Audio file size: {file_size} bytes")
-        notify("finalizing", "Almost done...")
+        recording_duration = time.time() - _recording_start_time if _recording_start_time else 0
+        log(f"Audio file size: {file_size} bytes (duration: {recording_duration:.1f}s)")
+        notify("finalizing", f"Processing {recording_duration:.1f}s of audio...")
 
-    # T1.2: Exception isolation — daemon must NEVER crash here
+    # T1.2: Exception isolation
     text = ""
     try:
         log("TRANSCRIBING...")
@@ -253,7 +289,7 @@ def stop_recording():
             )
             log("INJECTED via wtype")
         else:
-            log("EMPTY transcription (silence?)")
+            log("EMPTY transcription (?)")
 
         os.remove(AUDIO)
 
@@ -262,13 +298,13 @@ def stop_recording():
         notify("error", str(e))
 
     finally:
-        # T2.4: Restore Bluetooth profile
         set_bluetooth_profile("a2dp-sink")
+        _processing = False  # Unlock
         notify("done", text if text else "(no text)")
 
 
 def cleanup():
-    global recorder, _recording_timer
+    global recorder, _recording_timer, _countdown_timer, _processing
     log("Cleanup called")
 
     if _recording_timer is not None:
@@ -284,6 +320,8 @@ def cleanup():
             recorder.wait()
 
     recorder = None
+    _countdown_timer = None
+    _processing = False
 
     if os.path.exists(AUDIO):
         os.remove(AUDIO)
@@ -291,7 +329,6 @@ def cleanup():
     if os.path.exists(SOCKET):
         os.remove(SOCKET)
 
-    # Restore BT profile on cleanup too
     set_bluetooth_profile("a2dp-sink")
 
 
@@ -320,38 +357,26 @@ def main():
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET)
-
     os.chmod(SOCKET, 0o600)
-
     server.listen(5)
 
     log("voice-input daemon running")
 
     try:
-
         while True:
-
             connection, _ = server.accept()
-
             try:
-
                 command = connection.recv(32).decode().strip()
-
                 if command == "start":
                     start_recording()
-
                 elif command == "stop":
                     stop_recording()
-
                 elif command == "quit":
                     break
-
             finally:
                 connection.close()
-
     except KeyboardInterrupt:
         log("KeyboardInterrupt received")
-
     finally:
         cleanup()
         server.close()
