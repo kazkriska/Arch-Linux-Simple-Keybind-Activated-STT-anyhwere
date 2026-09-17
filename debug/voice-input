@@ -38,11 +38,11 @@ def log(msg):
 def notify(state, body):
     """Send a stateful notification via dunstify."""
     states = {
-        "listening":    ("Voice Input: Listening...",   "microphone-input",  "normal"),
-        "transcribing": ("Voice Input: Transcribing...", "microphone-input",  "normal"),
-        "finalizing":   ("Voice Input: Finalizing...",   "microphone-input",  "normal"),
-        "done":         ("Voice Input: Done",            "microphone-input",  "low"),
-        "error":        (f"Voice Input: {state}",        "microphone-input",  "critical"),
+        "listening":    ("Voice Input: Listening...",   "audio-input-microphone",  "normal"),
+        "transcribing": ("Voice Input: Transcribing...", "audio-input-microphone",  "normal"),
+        "finalizing":   ("Voice Input: Finalizing...",   "audio-input-microphone",  "normal"),
+        "done":         ("Voice Input: Done",            "audio-input-microphone",  "low"),
+        "error":        (f"Voice Input: {state}",        "audio-input-microphone",  "critical"),
     }
     summary, icon, urgency = states.get(state, (state, "microphone-input", "normal"))
     try:
@@ -247,7 +247,7 @@ def cleanup():
         _recording_timer.cancel()
         _recording_timer = None
 
-    if recorder is not None and recorder.poll() is not None:
+    if recorder is not None and recorder.poll() is None:
         recorder.terminate()
         try:
             recorder.wait(timeout=3)
