@@ -37,14 +37,19 @@ def log(msg):
         pass
 
 
-def notify(state, body, timeout=None):
-    """Send a stateful notification via dunstify."""
+def notify(state, body, timeout=None, progress=None):
+    """Send a stateful notification via dunstify.
+    
+    Uses --stack-tag so the same notification is replaced
+    in-place across separate process invocations.
+    progress: int 0-100 for the progress bar (countdown)
+    """
     states = {
         "listening":    ("Voice Input: Listening...",   "audio-input-microphone",  "normal"),
         "transcribing": ("Voice Input: Transcribing...", "audio-input-microphone",  "normal"),
         "finalizing":   ("Voice Input: Finalizing...",   "audio-input-microphone",  "normal"),
         "done":         ("Voice Input: Done",            "audio-input-microphone",  "low"),
-        "error":        (f"Voice Input: {state}",        "audio-input-microphone",  "critical"),
+        "error":        (f"Voice Input: {state}",        "dialog-error",            "critical"),
         "busy":         ("Voice Input: Busy",            "audio-input-microphone",  "normal"),
         "warning":      ("Voice Input: Warning",         "audio-input-microphone",  "normal"),
     }
@@ -52,17 +57,19 @@ def notify(state, body, timeout=None):
     if timeout is None:
         timeout = "0" if state not in ("done", "error", "busy", "warning") else ("3000" if state == "done" else "5000")
     try:
+        cmd = [
+            "dunstify",
+            "--stack-tag", "voice-input",
+            "--app-name", "voice-input",
+            "-t", str(timeout),
+            "-u", urgency,
+            "-i", icon,
+        ]
+        if progress is not None:
+            cmd.extend(["-h", f"int:value:{progress}"])
+        cmd.extend([summary, body])
         subprocess.run(
-            [
-                "dunstify",
-                "--stack-tag", "voice-input",
-                "--app-name", "voice-input",
-                "-t", str(timeout),
-                "-u", urgency,
-                "-i", icon,
-                summary,
-                body,
-            ],
+            cmd,
             check=False,
             timeout=5,
         )
@@ -127,13 +134,18 @@ def _force_stop():
 
 
 def _update_countdown():
-    """Update notification with remaining time every second."""
+    """Update notification with remaining time every second using progress bar."""
     global _recording_start_time
     while recorder is not None and recorder.poll() is None:
         elapsed = time.time() - _recording_start_time
         remaining = max(0, MAX_RECORDING_SECONDS - int(elapsed))
+        # Progress bar shows remaining time (inverted: 100% at start, 0% at end)
+        progress = int((remaining / MAX_RECORDING_SECONDS) * 100)
         if remaining <= 10:
-            notify("listening", f"Speak now. Release ALT+T when done. ({remaining}s left)")
+            notify("listening", f"Speak now. Release ALT+T when done. ({remaining}s left)", progress=progress)
+        else:
+            # Just update the progress bar without changing the body
+            notify("listening", "Speak now. Release ALT+T when done.", progress=progress)
         time.sleep(1)
 
 
