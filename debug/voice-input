@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+
+import os
+import signal
+import socket
+import subprocess
+
+from faster_whisper import WhisperModel
+
+
+SOCKET = "/tmp/voice-input.sock"
+AUDIO = "/tmp/voice-input.wav"
+MODEL_PATH = os.path.expanduser(
+    "~/.local/share/voice-input/models/small"
+)
+
+model = None
+recorder = None
+
+
+def load_model():
+    global model
+
+    if model is None:
+        print("Loading local Whisper model...", flush=True)
+
+        model = WhisperModel(
+            MODEL_PATH,
+            device="cpu",
+            compute_type="int8",
+        )
+
+        print("Whisper model loaded.", flush=True)
+
+
+def start_recording():
+    global recorder
+
+    if recorder is not None and recorder.poll() is None:
+        return
+
+    if os.path.exists(AUDIO):
+        os.remove(AUDIO)
+
+    print("Recording...", flush=True)
+
+    recorder = subprocess.Popen([
+        "pw-record",
+        "--rate", "16000",
+        "--channels", "1",
+        "--format", "s16",
+        AUDIO,
+    ])
+
+
+def stop_recording():
+    global recorder
+
+    if recorder is None:
+        return
+
+    if recorder.poll() is None:
+        print("Stopping recording...", flush=True)
+
+        recorder.terminate()
+        recorder.wait()
+
+    recorder = None
+
+    if not os.path.exists(AUDIO):
+        print("No audio file created.", flush=True)
+        return
+
+    print("Transcribing...", flush=True)
+
+    load_model()
+
+    segments, _ = model.transcribe(
+        AUDIO,
+        language="en",
+        beam_size=5,
+        vad_filter=True,
+    )
+
+    text = " ".join(
+        segment.text.strip()
+        for segment in segments
+    ).strip()
+
+    print(f"Text: {text}", flush=True)
+
+    if text:
+        subprocess.run(
+            ["wtype", "--", text],
+            check=False,
+        )
+
+    os.remove(AUDIO)
+
+
+def cleanup():
+    global recorder
+
+    if recorder is not None and recorder.poll() is None:
+        recorder.terminate()
+        recorder.wait()
+
+    recorder = None
+
+    if os.path.exists(AUDIO):
+        os.remove(AUDIO)
+
+    if os.path.exists(SOCKET):
+        os.remove(SOCKET)
+
+
+def main():
+
+    if os.path.exists(SOCKET):
+        os.remove(SOCKET)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET)
+
+    os.chmod(SOCKET, 0o600)
+
+    server.listen(5)
+
+    print("voice-input daemon running", flush=True)
+
+    try:
+
+        while True:
+
+            connection, _ = server.accept()
+
+            try:
+
+                command = connection.recv(32).decode().strip()
+
+                if command == "start":
+                    start_recording()
+
+                elif command == "stop":
+                    stop_recording()
+
+                elif command == "quit":
+                    break
+
+            finally:
+                connection.close()
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        cleanup()
+        server.close()
+
+
+if __name__ == "__main__":
+    main()
