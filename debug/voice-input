@@ -4,106 +4,256 @@ import os
 import signal
 import socket
 import subprocess
+import sys
+import threading
+from datetime import datetime
 
 from faster_whisper import WhisperModel
 
 
 SOCKET = "/tmp/voice-input.sock"
 AUDIO = "/tmp/voice-input.wav"
+LOG_FILE = "/tmp/voice-input.log"
 MODEL_PATH = os.path.expanduser(
     "~/.local/share/voice-input/models/small"
 )
 
 model = None
 recorder = None
+_lock = threading.Lock()
+MAX_RECORDING_SECONDS = 60
+
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def notify(state, body):
+    """Send a stateful notification via dunstify."""
+    states = {
+        "listening":    ("Voice Input: Listening...",   "microphone-input",  "normal"),
+        "transcribing": ("Voice Input: Transcribing...", "microphone-input",  "normal"),
+        "finalizing":   ("Voice Input: Finalizing...",   "microphone-input",  "normal"),
+        "done":         ("Voice Input: Done",            "microphone-input",  "low"),
+        "error":        (f"Voice Input: {state}",        "microphone-input",  "critical"),
+    }
+    summary, icon, urgency = states.get(state, (state, "microphone-input", "normal"))
+    try:
+        subprocess.run(
+            [
+                "dunstify",
+                "-r", "9999",
+                "-t", "0" if state not in ("done", "error") else ("3000" if state == "done" else "5000"),
+                "-u", urgency,
+                "-a", "voice-input",
+                "-i", icon,
+                summary,
+                body,
+            ],
+            check=False,
+            timeout=5,
+        )
+    except Exception as e:
+        log(f"notify error: {e}")
 
 
 def load_model():
     global model
-
     if model is None:
-        print("Loading local Whisper model...", flush=True)
-
+        log("Loading local Whisper model...")
         model = WhisperModel(
             MODEL_PATH,
             device="cpu",
             compute_type="int8",
         )
+        log("Whisper model loaded.")
 
-        print("Whisper model loaded.", flush=True)
+
+def get_bluetooth_profile():
+    """Get the current profile of the Bluetooth headset card."""
+    try:
+        result = subprocess.run(
+            ["pactl", "get-card-profile", "bluez_card.8C_0D_D9_58_20_F2"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception as e:
+        log(f"BT profile read error: {e}")
+    return None
+
+
+def set_bluetooth_profile(profile):
+    """Set the Bluetooth headset profile."""
+    try:
+        subprocess.run(
+            ["pactl", "set-card-profile", "bluez_card.8C_0D_D9_58_20_F2", profile],
+            check=True, timeout=5,
+        )
+        log(f"BT profile set to: {profile}")
+    except Exception as e:
+        log(f"BT profile set error: {e}")
+
+
+_recording_timer = None
+
+
+def _force_stop():
+    global recorder
+    log("MAX recording duration reached, force-stopping")
+    if recorder is not None and recorder.poll() is None:
+        recorder.terminate()
 
 
 def start_recording():
-    global recorder
+    global recorder, _recording_timer
 
-    if recorder is not None and recorder.poll() is None:
-        return
+    with _lock:
+        if recorder is not None and recorder.poll() is None:
+            log("Already recording, ignoring duplicate start")
+            return
 
-    if os.path.exists(AUDIO):
-        os.remove(AUDIO)
+        if os.path.exists(AUDIO):
+            os.remove(AUDIO)
 
-    print("Recording...", flush=True)
+        # T2.3: Switch Bluetooth to HFP for stable input
+        current_profile = get_bluetooth_profile()
+        if current_profile and "headset" not in current_profile.lower():
+            set_bluetooth_profile("headset-head-unit")
 
-    recorder = subprocess.Popen([
-        "pw-record",
-        "--rate", "16000",
-        "--channels", "1",
-        "--format", "s16",
-        AUDIO,
-    ])
+        # T4.2: Validate PipeWire is available
+        try:
+            subprocess.run(
+                ["pw-record", "--version"],
+                capture_output=True, timeout=5,
+            )
+        except Exception as e:
+            log(f"PipeWire health check failed: {e}")
+            notify("error", f"PipeWire not available: {e}")
+            return
+
+        log("START recording")
+        recorder = subprocess.Popen([
+            "pw-record",
+            "--rate", "16000",
+            "--channels", "1",
+            "--format", "s16",
+            AUDIO,
+        ])
+
+        # T4.1: Start max-duration timer
+        _recording_timer = threading.Timer(MAX_RECORDING_SECONDS, _force_stop)
+        _recording_timer.daemon = True
+        _recording_timer.start()
+
+    notify("listening", "Speak now. Release ALT+T when done.")
 
 
 def stop_recording():
-    global recorder
+    global recorder, _recording_timer
 
-    if recorder is None:
-        return
+    with _lock:
+        if recorder is None:
+            log("stop called but no active recorder")
+            return
 
-    if recorder.poll() is None:
-        print("Stopping recording...", flush=True)
+        # Cancel the max-duration timer
+        if _recording_timer is not None:
+            _recording_timer.cancel()
+            _recording_timer = None
 
-        recorder.terminate()
-        recorder.wait()
+        if recorder.poll() is None:
+            log("STOP recording")
+            recorder.terminate()
+            try:
+                recorder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log("recorder did not terminate in 5s, sending SIGKILL")
+                recorder.kill()
+                recorder.wait()
 
-    recorder = None
+        recorder = None
 
-    if not os.path.exists(AUDIO):
-        print("No audio file created.", flush=True)
-        return
+        # T4.2: Validate audio file before transcription
+        if not os.path.exists(AUDIO):
+            log("No audio file created.")
+            notify("error", "No audio was recorded")
+            return
 
-    print("Transcribing...", flush=True)
+        file_size = os.path.getsize(AUDIO)
+        if file_size == 0:
+            log("Audio file is empty (0 bytes).")
+            os.remove(AUDIO)
+            notify("error", "Recording was empty")
+            return
 
-    load_model()
+        log(f"Audio file size: {file_size} bytes")
+        notify("transcribing", "Processing your speech...")
 
-    segments, _ = model.transcribe(
-        AUDIO,
-        language="en",
-        beam_size=5,
-        vad_filter=True,
-    )
+    # T1.2: Exception isolation — daemon must NEVER crash here
+    text = ""
+    try:
+        log("TRANSCRIBING...")
+        load_model()
 
-    text = " ".join(
-        segment.text.strip()
-        for segment in segments
-    ).strip()
-
-    print(f"Text: {text}", flush=True)
-
-    if text:
-        subprocess.run(
-            ["wtype", "--", text],
-            check=False,
+        segments, _ = model.transcribe(
+            AUDIO,
+            language="en",
+            beam_size=5,
+            vad_filter=True,
         )
 
-    os.remove(AUDIO)
+        text = " ".join(
+            segment.text.strip()
+            for segment in segments
+        ).strip()
+
+        log(f"RESULT: \"{text}\"")
+
+        if text:
+            subprocess.run(
+                ["wtype", "--", text],
+                check=False,
+                timeout=10,
+            )
+            log("INJECTED via wtype")
+        else:
+            log("EMPTY transcription (silence?)")
+
+        os.remove(AUDIO)
+
+    except Exception as e:
+        log(f"TRANSCRIPTION ERROR: {e}")
+        notify("error", str(e))
+
+    finally:
+        # T2.4: Restore Bluetooth profile
+        set_bluetooth_profile("a2dp-sink")
+        notify("done", text if text else "(no text)")
 
 
 def cleanup():
-    global recorder
+    global recorder, _recording_timer
+    log("Cleanup called")
 
-    if recorder is not None and recorder.poll() is None:
+    if _recording_timer is not None:
+        _recording_timer.cancel()
+        _recording_timer = None
+
+    if recorder is not None and recorder.poll() is not None:
         recorder.terminate()
-        recorder.wait()
+        try:
+            recorder.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            recorder.kill()
+            recorder.wait()
 
     recorder = None
 
@@ -113,11 +263,32 @@ def cleanup():
     if os.path.exists(SOCKET):
         os.remove(SOCKET)
 
+    # Restore BT profile on cleanup too
+    set_bluetooth_profile("a2dp-sink")
+
+
+def _signal_handler(signum, frame):
+    log(f"Received signal {signum}, shutting down")
+    cleanup()
+    sys.exit(0)
+
 
 def main():
-
+    # T1.4: Check for stale files from previous crash
     if os.path.exists(SOCKET):
+        log("RECOVERY: Stale socket found from previous run, removing")
         os.remove(SOCKET)
+
+    if os.path.exists(AUDIO):
+        size = os.path.getsize(AUDIO)
+        log(f"RECOVERY: Stale audio file found ({size} bytes), preserving")
+        recovery_path = f"/tmp/voice-input-recovered-{datetime.now().strftime('%Y%m%d-%H%M%S')}.wav"
+        os.rename(AUDIO, recovery_path)
+        log(f"RECOVERY: Audio preserved to {recovery_path}")
+
+    # T1.1: Install signal handlers
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET)
@@ -126,7 +297,7 @@ def main():
 
     server.listen(5)
 
-    print("voice-input daemon running", flush=True)
+    log("voice-input daemon running")
 
     try:
 
@@ -151,7 +322,7 @@ def main():
                 connection.close()
 
     except KeyboardInterrupt:
-        pass
+        log("KeyboardInterrupt received")
 
     finally:
         cleanup()
