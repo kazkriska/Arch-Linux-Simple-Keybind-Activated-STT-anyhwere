@@ -119,6 +119,7 @@ def _force_stop():
     """Called when MAX_RECORDING_SECONDS is reached."""
     global recorder
     log("MAX recording duration reached, stopping and processing")
+    notify("warning", "Max time reached, processing audio...", timeout="0")
     if recorder is not None and recorder.poll() is None:
         recorder.terminate()
     # Trigger transcription
