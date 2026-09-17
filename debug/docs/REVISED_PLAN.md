@@ -220,40 +220,40 @@ user's direct feedback and the real installed system state.
   PART 5: TASK LIST (execution order)
 ═══════════════════════════════════════════════════════════════
 
-  Phase 1 — Foundation (CRITICAL)
+  Phase 1 — Foundation (CRITICAL) ✅ COMPLETE
+  ──────────────────────────────────────────────
+
+  T1.1  ✅ Add signal handlers for SIGTERM/SIGINT
+  T1.2  ✅ Add try/except around stop_recording()
+  T1.3  ✅ Add timeout to recorder.wait()
+  T1.4  ✅ Add logging to /tmp/voice-input.log
+
+  Phase 2 — Bluetooth Lock ✅ COMPLETE
+  ─────────────────────────────────────
+
+  T2.1  ✅ Add get_current_bluetooth_profile() function
+  T2.2  ✅ Add set_bluetooth_profile(profile) function
+  T2.3  ✅ Call set HFP in start_recording()
+  T2.4  ✅ Call restore profile after transcription (post-stop)
+
+  Phase 3 — Notification Overlay ✅ COMPLETE
+  ───────────────────────────────────────────
+
+  T3.1  ✅ Add notify(state, message) function
+  T3.2  ✅ Call notify("listening") in start_recording()
+  T3.3  ✅ Call notify("transcribing") when speech detected
+  T3.4  ✅ Call notify("finalizing") in stop_recording()
+  T3.5  ✅ Call notify("done") after successful transcription
+  T3.6  ✅ Call notify("error") on any exception
+
+  Phase 4 — Robustness ✅ COMPLETE
   ─────────────────────────────────
 
-  T1.1  Add signal handlers for SIGTERM/SIGINT
-  T1.2  Add try/except around stop_recording()
-  T1.3  Add timeout to recorder.wait()
-  T1.4  Add logging to /tmp/voice-input.log
-
-  Phase 2 — Bluetooth Lock
-  ─────────────────────────
-
-  T2.1  Add get_current_bluetooth_profile() function
-  T2.2  Add set_bluetooth_profile(profile) function
-  T2.3  Call set HFP in start_recording()
-  T2.4  Call restore profile after transcription (post-stop)
-
-  Phase 3 — Notification Overlay
-  ───────────────────────────────
-
-  T3.1  Add notify(state, message) function
-  T3.2  Call notify("listening") in start_recording()
-  T3.3  Call notify("transcribing") when speech detected
-  T3.4  Call notify("finalizing") in stop_recording()
-  T3.5  Call notify("done") after successful transcription
-  T3.6  Call notify("error") on any exception
-
-  Phase 4 — Robustness
-  ─────────────────────
-
-  T4.1  Add max recording timer (60s)
-  T4.2  Add audio file size validation
-  T4.3  Add PipeWire health check
-  T4.4  Add crash recovery logging on startup
-  T4.5  Add thread safety with Lock()
+  T4.1  ✅ Add max recording timer (60s)
+  T4.2  ✅ Add audio file size validation
+  T4.3  ✅ Add PipeWire health check
+  T4.4  ✅ Add crash recovery logging on startup
+  T4.5  ✅ Add thread safety with Lock()
 
 
 ═══════════════════════════════════════════════════════════════
