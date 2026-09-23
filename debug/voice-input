@@ -295,12 +295,32 @@ def stop_recording():
         log(f"RESULT: \"{text}\"")
 
         if text:
-            subprocess.run(
-                ["wtype", "--", text],
-                check=False,
-                timeout=10,
-            )
-            log("INJECTED via wtype")
+            # Always copy to clipboard first (reliable across all apps)
+            try:
+                subprocess.run(
+                    ["wl-copy", text],
+                    check=True, timeout=5,
+                )
+                log("COPIED to clipboard")
+            except Exception as e:
+                log(f"Clipboard copy error: {e}")
+
+            # Then try wtype to type into focused app
+            try:
+                result = subprocess.run(
+                    ["wtype", "--", text],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    log("INJECTED via wtype")
+                else:
+                    log(f"wtype failed (rc={result.returncode}): {result.stderr.strip()}")
+                    log("Text is in clipboard — paste manually with Ctrl+V")
+                    notify("warning", "wtype failed — text copied to clipboard", timeout="5000")
+            except Exception as e:
+                log(f"wtype error: {e}")
+                log("Text is in clipboard — paste manually with Ctrl+V")
+                notify("warning", "wtype error — text copied to clipboard", timeout="5000")
         else:
             log("EMPTY transcription (?)")
 
