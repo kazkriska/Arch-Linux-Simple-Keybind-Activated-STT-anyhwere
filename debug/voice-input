@@ -123,12 +123,12 @@ _recording_start_time = None
 
 
 def _force_stop():
-    """Called when MAX_RECORDING_SECONDS is reached."""
+    """Called when MAX_SECONDS reached. Stop recorder and process audio."""
     global recorder
     log("MAX recording duration reached, stopping and processing")
-    notify("warning", "Max time reached, processing audio...", timeout="0")
     if recorder is not None and recorder.poll() is None:
         recorder.terminate()
+        recorder.wait(timeout=3)  # Wait for file to be flushed
     # Trigger transcription
     stop_recording()
 
@@ -284,7 +284,7 @@ def stop_recording():
             AUDIO,
             language="en",
             beam_size=5,
-            vad_filter=True,
+            vad_filter=False,
         )
 
         text = " ".join(
