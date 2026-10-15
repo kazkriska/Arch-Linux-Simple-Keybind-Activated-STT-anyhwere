@@ -1,0 +1,16 @@
+[Unit]
+Description=Local Whisper voice input daemon
+After=pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/voice-input/venv/bin/python %h/.local/bin/voice-input
+Restart=on-failure
+RestartSec=2
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+[Install]
+WantedBy=default.target
